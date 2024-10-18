@@ -4,6 +4,9 @@ Batch Effect Associated Missing Values (BEAMs) are batch-wise missingness induce
 
 # Files
 CPTAC - This folder contains the expression data from the CPTAC study 6 from four machines
+
 CPTAC dataset.Rmd - This R markdown file runs the codes to load the CPTAC dataset and generate the plots in the manuscript
+
 Simulated datasets.Rmd - This R markdown file runs the codes to simulate datasets and generate the plots in the manuscript
+
 functions.R - This R script contains the functions required for the two markdown files to run
