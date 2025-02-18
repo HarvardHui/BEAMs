@@ -1,0 +1,460 @@
+---
+title: "Assessing the Impact of Batch Effect Associated Missing Values on Downstream Analysis in High-Throughput Biomedical Data"
+author: "Harvard Wai Hann Hui"
+date: "2025-02-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load the libraries
+```{r}
+library(corrplot)
+library(gtools)
+library(ggplot2)
+library(ggfortify)
+library(mice)
+library(sva)
+library(vegan)
+library(imputeLCMD)
+library(limma)
+library(reshape2)
+library(missForest)
+library(ggrepel)
+library(dplyr)
+library(grid)
+library(gridExtra)
+library(pROC)
+library(ggpubr)
+library(pheatmap)
+library(visdat)
+library(magrittr)
+library(MESS)
+library(mvdalab)
+library(ggplotify)
+library(ggdist)
+library(here)
+
+wd <- here()
+source(paste0(wd, "/BEAMs-main/BEAMs-main/functions.r"))
+```
+
+Set parameters for the simulations
+```{r}
+# Simulation parameters
+nbatches = 4 # number of batches
+nclasses = 2 # number of classes
+classbatch_samples = 5 # number of samples in each class-batch
+batch_samples = classbatch_samples*nclasses # number of samples in a batch
+nfeatures = 1000 # number of features
+nsamples = nbatches * nclasses * classbatch_samples # total number of samples
+iterations = 10 # number of iterations
+
+dataset_select = "metabolomics"
+
+# MV proportions simulated
+mv_prop = 0.40 # Total MV percentage
+mnar_ratio = 0.8 # MNAR proportion (change to 0.2 for MCAR dominant analysis)
+
+# Create class-batch matrix for simulating data
+bc_mat = matrix(classbatch_samples, nrow=nclasses, ncol=nbatches)
+```
+
+Import dataset
+```{r}
+multi_meta <- read.csv(paste0(wd,"/BEAMs-main/BEAMs-main/Multiomics datasets/meta_full_dataset_3omics.csv"))
+
+if (dataset_select == "proteomics"){
+  #### Proteomics
+  multi_proteomics <- read.csv(paste0(wd,"/BEAMs-main/BEAMs-main/Multiomics datasets/Proteomics_Balanced_log2FOT_r3489c45.csv"))
+  multi_meta$library <- gsub("QE-", "QE_", multi_meta$library)
+  colnames(multi_proteomics) <- gsub("QE.", "QE_", colnames(multi_proteomics))
+  proteomics_meta <- multi_meta[multi_meta$library %in% colnames(multi_proteomics),]
+  
+  rownames(multi_proteomics) <- multi_proteomics$X
+  multi_proteomics <- multi_proteomics[,-1]
+  hist(as.numeric(as.matrix(multi_proteomics)))
+
+  testdata <- apply(multi_proteomics, 2, as.numeric)
+  testdata2 <- testdata
+  testdata2[testdata2==min(testdata2)] <- NA
+  testdata2 <- na.omit(testdata2)
+  hist(as.numeric(as.matrix(testdata2)))
+  
+  # Set the meta data
+  class_factor = proteomics_meta$sample
+  batch_factor = proteomics_meta$batch
+  pdat <- data.frame(class=class_factor, batch=batch_factor)
+  
+  # Extract only the first 2 classes and reduce to 5 batches
+  testdata2 <- testdata2[,-which(proteomics_meta$sample == unique(proteomics_meta$sample)[1])]
+  pdat <- pdat[-which(class_factor == unique(proteomics_meta$sample)[1]),]
+}
+
+if (dataset_select == "metabolomics"){
+  #### Metabolomics
+  #### Checking the metabolomics data
+  multi_metabolomics <- read.csv(paste0(wd, "/BEAMs-main/BEAMs-main/Multiomics datasets/Metabolomics_Balanced_log2expr_r71c45.csv"))
+  metabolomics_meta <- multi_meta[multi_meta$library %in% colnames(multi_metabolomics),]
+  
+  rownames(multi_metabolomics) <- multi_metabolomics$X
+  multi_metabolomics <- multi_metabolomics[,-1]
+  multi_metabolomics <- multi_metabolomics[,-1]
+  
+  hist(as.numeric(as.matrix(multi_metabolomics)))
+  
+  testdata <- apply(multi_metabolomics, 2, as.numeric)
+  testdata2 <- testdata
+  testdata2[testdata2 == 0] <- NA
+  
+  # We remove platform "U" since it seems to have issues with MVs
+  testdata2 <- testdata2[,metabolomics_meta$platform == "T"]
+  testdata2 <- na.omit(testdata2)
+  metabolomics_meta <- metabolomics_meta[metabolomics_meta$platform == "T",]
+
+  # Set the meta data
+  class_factor = metabolomics_meta$sample
+  batch_factor = metabolomics_meta$batch
+  pdat <- data.frame(class=class_factor, batch=batch_factor)
+  
+  # Extract only the first 2 classes and reduce to 5 batches
+  testdata2 <- testdata2[,-which(metabolomics_meta$sample == unique(metabolomics_meta$sample)[1])]
+  pdat <- pdat[-which(class_factor == unique(metabolomics_meta$sample)[1]),]
+}
+
+testdata2 <- testdata2[,which(pdat$batch %in% unique(pdat$batch)[1:5])]
+pdat <- pdat[which(pdat$batch %in% unique(pdat$batch)[1:5]),]
+pdat <- apply(pdat, 2, function(x) as.numeric(as.factor(x))) %>% as.data.frame()
+
+class_factor = as.factor(pdat$class)
+batch_factor = as.factor(pdat$batch)
+pdat <- data.frame(class=class_factor, batch=batch_factor)
+
+# Reset parameters
+nbatches = 5 # number of batches
+nclasses = 2 # number of classes
+classbatch_samples = 1 # number of samples in each class-batch
+batch_samples = classbatch_samples*nclasses # number of samples in a batch
+nfeatures = nrow(testdata2) # number of features
+nsamples = nrow(pdat) # total number of samples
+
+# Initiate list of datasets
+save_datasets <- rep(list(testdata2), iterations)
+
+# Corrected true datasets
+save_ComBat_datasets <- lapply(save_datasets, function(x) {
+  x <- quantileNormByClass(x, class_factor)
+  x <- do.combat.sim(x, pdat=pdat, cov=F)
+  return(x)
+})
+
+```
+
+Simulate missing values
+```{r}
+save_batch_mv_prop = c()
+save_beams <- c()
+save_beam_df <- vector("list", length = iterations)
+save_control_df <- vector("list", length = iterations)
+save_beam_true <- vector("list", length = iterations)
+save_control_true <- vector("list", length = iterations)
+save_ComBat_beam_true <- vector("list", length = iterations)
+save_ComBat_control_true <- vector("list", length = iterations)
+
+for (iter in 1:iterations){
+  set.seed(iter)
+  seed = iter
+  
+  # Insert BEAMs
+  beam.df = jin.MNAR(save_datasets[[iter]], mv_prop, mnar_ratio, beams = T, batch_factor = batch_factor, seed=seed)
+  
+  # Recalculate missingness proportion to insert into control
+  new_mv_prop = sum(is.na(beam.df$msdata))/length(beam.df$msdata)
+  
+  # Insert Control MVs
+  control.df = jin.MNAR(save_datasets[[iter]], new_mv_prop, mnar_ratio, beams = F, batch_factor = batch_factor, seed=seed)
+  
+  beam_df <- beam.df$msdata
+  control_df <- control.df$msdata
+  
+  rownames(control_df) = seq(nrow(save_datasets[[iter]]))
+  rownames(beam_df) = seq(nrow(save_datasets[[iter]]))
+  rownames(save_datasets[[iter]]) = seq(nrow(save_datasets[[iter]]))
+
+  # Remove features with too many missing values
+  control_df = filter.mvs(control_df, (nsamples-batch_samples)/nsamples) 
+  beam_df = filter.mvs(beam_df, (nsamples-batch_samples)/nsamples) 
+
+  # Find feature intersect
+  feature_intersect <- intersect(rownames(control_df), rownames(beam_df))
+  control_df <- control_df[feature_intersect,] %>% quantileNormByClass(., class_factor)
+  beam_df <- beam_df[feature_intersect,] %>% quantileNormByClass(., class_factor)
+  
+  control_true = save_datasets[[iter]][rownames(control_df),] %>% quantileNormByClass(., class_factor)
+  beam_true = save_datasets[[iter]][rownames(beam_df),] %>% quantileNormByClass(., class_factor)
+
+  ComBat_control_true = save_datasets[[iter]][rownames(control_df),] %>%
+    quantileNormByClass(., class_factor) %>%
+    do.combat.sim(., pdat=pdat, cov=F)
+  ComBat_beam_true = save_datasets[[iter]][rownames(beam_df),] %>%
+    quantileNormByClass(., class_factor) %>%
+    do.combat.sim(., pdat=pdat, cov=F)
+
+  
+  save_beam_df[[iter]] <- beam_df
+  save_control_df[[iter]] <- control_df
+  save_beam_true[[iter]] <- beam_true
+  save_control_true[[iter]] <- control_true
+  save_ComBat_beam_true[[iter]] <- ComBat_beam_true
+  save_ComBat_control_true[[iter]] <- ComBat_control_true}
+```
+
+
+Impute missing values
+```{r}
+batch_samples = nsamples/nbatches
+
+save_Control_list <- vector("list", length = iterations)
+save_BEAM_list <- vector("list", length = iterations)
+
+
+
+for (iter in 1:iterations){
+  # Set seed for reproducibility
+  set.seed(iter)
+  
+  # Perform missing value imputation using KNN, MinProb, mean, and SVD
+  KNN_control = do.knn(save_control_df[[iter]], k=floor(sqrt(nsamples/2)))
+  MinProb_control = impute.MinProb(save_control_df[[iter]], tune.sigma=0.5)
+  Mean_control = mean.imp(save_control_df[[iter]])
+  SVD_control = t(impute.wrapper.SVD(t(save_control_df[[iter]]), K=3))
+  MICE_control = mice(save_control_df[[iter]], printFlag=F) %>% complete(.)
+  RF_control = missForest(save_control_df[[iter]])$ximp
+  
+  KNN_beam = do.knn(save_beam_df[[iter]], k=floor(sqrt(nsamples/2)))
+  MinProb_beam = impute.MinProb(save_beam_df[[iter]], tune.sigma=0.5)
+  Mean_beam = mean.imp(save_beam_df[[iter]])
+  SVD_beam = t(impute.wrapper.SVD(t(save_beam_df[[iter]]), K=3))
+  MICE_beam = mice(save_beam_df[[iter]], printFlag=F) %>% complete(.)
+  RF_beam = missForest(save_beam_df[[iter]])$ximp
+  
+  # Save imputed datasets
+  Control_list = list(`Ground truth`=save_control_true[[iter]], KNN=KNN_control, MinProb=MinProb_control, Mean=Mean_control, SVD=SVD_control, MICE=MICE_control, RF=RF_control)
+  BEAM_list = list(`Ground truth`=save_beam_true[[iter]], KNN=KNN_beam, MinProb=MinProb_beam, Mean=Mean_beam, SVD=SVD_beam, MICE=MICE_beam, RF=RF_beam)
+  
+  save_Control_list[[iter]] <- Control_list
+  save_BEAM_list[[iter]] <- BEAM_list
+}
+```
+
+Correct batch effect by ComBat
+```{r}
+save_ComBat_Control_list <- vector("list", length = iterations)
+save_ComBat_BEAM_list <- vector("list", length = iterations)
+#### Apply BECAS
+for (iter in 1:iterations){
+  # Set seed for reproducibility
+  set.seed(iter)
+  
+  # Apply ComBat
+  ComBat_Control_list = lapply(save_Control_list[[iter]], function(x) do.combat.sim(x, pdat, cov=F))
+  ComBat_BEAM_list = lapply(save_BEAM_list[[iter]], function(x) do.combat.sim(x, pdat, cov=F))
+  
+  # Save batch corrected datasets
+  save_ComBat_Control_list[[iter]] <- ComBat_Control_list
+  save_ComBat_BEAM_list[[iter]] <- ComBat_BEAM_list
+}
+
+```
+
+Check RMSE
+```{r, fig.width=10, fig.height=5}
+# RMSE function
+Rmse <- function(imp, mis, true, norm = FALSE){
+  imp <- as.matrix(imp)
+  mis <- as.matrix(mis)
+  true <- as.matrix(true)
+  missIndex <- which(is.na(mis))
+  errvec <- imp[missIndex] - true[missIndex]
+  rmse <- sqrt(mean(errvec^2))
+  if (norm) {
+    rmse <- rmse/sd(true[missIndex])
+  }
+  return(rmse)
+}
+
+
+# Check RMSE by BEAMs severity
+split_beams <- function(df, batch, class){
+  # Discovered by one batch only
+  by1 = check_beams(df, class_factor=class, batch_factor=batch)
+  by1_df = df[by1,]
+  # Missing in at least one batch
+  ms_by1 = check_beams(df, class_factor=class, batch_factor=batch, by_single_batch = F)
+  ms_by1_only = ms_by1
+  ms_by1_only[by1 == TRUE] = FALSE
+  ms_by1_only_df = df[ms_by1_only,]
+  # Normal missingness
+  ms_df = df[ms_by1==FALSE,]
+  
+  return(list(noBEAMs = ms_df,
+              modBEAMs = ms_by1_only_df,
+              sevBEAMs = by1_df))
+}
+
+save_modBEAMs_control_RMSE <- vector("list", length=iterations)
+save_sevBEAMs_control_RMSE <- vector("list", length=iterations)
+save_modBEAMs_beam_RMSE <- vector("list", length=iterations)
+save_sevBEAMs_beam_RMSE <- vector("list", length=iterations)
+
+save_ComBat_modBEAMs_control_RMSE <- vector("list", length=iterations)
+save_ComBat_sevBEAMs_control_RMSE <- vector("list", length=iterations)
+save_ComBat_modBEAMs_beam_RMSE <- vector("list", length=iterations)
+save_ComBat_sevBEAMs_beam_RMSE <- vector("list", length=iterations)
+
+for (iter in 1:iterations){
+  
+  # Missing subsets
+  temp_mv_control <- save_control_df[[iter]]
+  temp_mv_beam <- save_beam_df[[iter]]
+  beam_subsets <- split_beams(temp_mv_beam, batch=pdat$batch, class=pdat$class)
+  control_subsets <- beam_subsets
+  helper_list <- as.list(1:3)
+  control_subsets <- lapply(helper_list, function(x){
+    control_subsets[[x]] <- temp_mv_control[rownames(beam_subsets[[x]]),]
+  })
+  names(control_subsets) <- c("noBEAMs", "modBEAMs", "sevBEAMs")
+  
+  # Imp subsets
+  temp_imp_control <- save_Control_list[[iter]]
+  temp_imp_beam <- save_BEAM_list[[iter]]
+  ComBat_temp_imp_control <- save_ComBat_Control_list[[iter]]
+  ComBat_temp_imp_beam <- save_ComBat_BEAM_list[[iter]]
+
+  
+  control_imp_subsets <- beam_subsets
+  beam_imp_subsets <- beam_subsets
+  ComBat_control_imp_subsets <- beam_subsets
+  ComBat_beam_imp_subsets <- beam_subsets
+
+  control_imp_subsets <- lapply(helper_list, function(x){
+    control_imp_subsets[[x]] <- lapply(temp_imp_control, function(j) j[rownames(beam_subsets[[x]]),])
+  })
+  beam_imp_subsets <- lapply(helper_list, function(x){
+    beam_imp_subsets[[x]] <- lapply(temp_imp_beam, function(j) j[rownames(beam_subsets[[x]]),])
+  })
+  ComBat_control_imp_subsets <- lapply(helper_list, function(x){
+    ComBat_control_imp_subsets[[x]] <- lapply(ComBat_temp_imp_control, function(j) j[rownames(beam_subsets[[x]]),])
+  })
+  ComBat_beam_imp_subsets <- lapply(helper_list, function(x){
+    ComBat_beam_imp_subsets[[x]] <- lapply(ComBat_temp_imp_beam, function(j) j[rownames(beam_subsets[[x]]),])
+  })
+
+  names(control_imp_subsets) <- c("noBEAMs", "modBEAMs", "sevBEAMs")
+  names(beam_imp_subsets) <- c("noBEAMs", "modBEAMs", "sevBEAMs")
+  names(ComBat_control_imp_subsets) <- c("noBEAMs", "modBEAMs", "sevBEAMs")
+  names(ComBat_beam_imp_subsets) <- c("noBEAMs", "modBEAMs", "sevBEAMs")
+
+  ## Ground truth subsets
+  # uncorrected
+  true_df <- save_control_true[[iter]]
+  ComBat_true_df <- save_ComBat_control_true[[iter]]
+  
+  true_subsets <- beam_subsets
+  ComBat_true_subsets <- beam_subsets
+  
+  true_subsets <- lapply(helper_list, function(x){
+    true_subsets[[x]] <- true_df[rownames(beam_subsets[[x]]),]
+  })
+  ComBat_true_subsets <- lapply(helper_list, function(x){
+    ComBat_true_subsets[[x]] <- ComBat_true_df[rownames(beam_subsets[[x]]),]
+  })
+  
+  names(true_subsets) <- c("noBEAMs", "modBEAMs", "sevBEAMs")
+  names(ComBat_true_subsets) <- c("noBEAMs", "modBEAMs", "sevBEAMs")
+  
+  #### Calculate RMSE
+  helper_list <- as.list(1:7)
+
+    # Uncorrected
+  modBEAMs_control_RMSE <- lapply(helper_list, function(x) Rmse(control_imp_subsets[["modBEAMs"]][[x]], control_subsets[["modBEAMs"]], true_subsets[["modBEAMs"]]))
+  sevBEAMs_control_RMSE <- lapply(helper_list, function(x) Rmse(control_imp_subsets[["sevBEAMs"]][[x]], control_subsets[["sevBEAMs"]], true_subsets[["sevBEAMs"]]))
+  
+  modBEAMs_beam_RMSE <- lapply(helper_list, function(x) Rmse(beam_imp_subsets[["modBEAMs"]][[x]], beam_subsets[["modBEAMs"]], true_subsets[["modBEAMs"]]))
+  sevBEAMs_beam_RMSE <- lapply(helper_list, function(x) Rmse(beam_imp_subsets[["sevBEAMs"]][[x]], beam_subsets[["sevBEAMs"]], true_subsets[["sevBEAMs"]]))
+  # Corrected
+  ComBat_modBEAMs_control_RMSE <- lapply(helper_list, function(x) Rmse(ComBat_control_imp_subsets[["modBEAMs"]][[x]], control_subsets[["modBEAMs"]], ComBat_true_subsets[["modBEAMs"]]))
+  ComBat_sevBEAMs_control_RMSE <- lapply(helper_list, function(x) Rmse(ComBat_control_imp_subsets[["sevBEAMs"]][[x]], control_subsets[["sevBEAMs"]], ComBat_true_subsets[["sevBEAMs"]]))
+  
+  ComBat_modBEAMs_beam_RMSE <- lapply(helper_list, function(x) Rmse(ComBat_beam_imp_subsets[["modBEAMs"]][[x]], beam_subsets[["modBEAMs"]], ComBat_true_subsets[["modBEAMs"]]))
+  ComBat_sevBEAMs_beam_RMSE <- lapply(helper_list, function(x) Rmse(ComBat_beam_imp_subsets[["sevBEAMs"]][[x]], beam_subsets[["sevBEAMs"]], ComBat_true_subsets[["sevBEAMs"]]))
+
+  
+  
+  names(modBEAMs_control_RMSE) <- c("Ground truth","KNN","Mean","MinProb","SVD","MICE","RF")
+  names(sevBEAMs_control_RMSE) <- c("Ground truth","KNN","Mean","MinProb","SVD","MICE","RF")
+  names(modBEAMs_beam_RMSE) <- c("Ground truth","KNN","Mean","MinProb","SVD","MICE","RF")
+  names(sevBEAMs_beam_RMSE) <- c("Ground truth","KNN","Mean","MinProb","SVD","MICE","RF")
+  
+  save_modBEAMs_control_RMSE[[iter]] <- modBEAMs_control_RMSE
+  save_sevBEAMs_control_RMSE[[iter]] <- sevBEAMs_control_RMSE
+  save_modBEAMs_beam_RMSE[[iter]] <- modBEAMs_beam_RMSE
+  save_sevBEAMs_beam_RMSE[[iter]] <- sevBEAMs_beam_RMSE
+  
+  save_ComBat_modBEAMs_control_RMSE[[iter]] <- ComBat_modBEAMs_control_RMSE
+  save_ComBat_sevBEAMs_control_RMSE[[iter]] <- ComBat_sevBEAMs_control_RMSE
+  save_ComBat_modBEAMs_beam_RMSE[[iter]] <- ComBat_modBEAMs_beam_RMSE
+  save_ComBat_sevBEAMs_beam_RMSE[[iter]] <- ComBat_sevBEAMs_beam_RMSE
+
+}
+
+#### Plot the data
+# Uncorrected
+plot_modBEAMs_control_RMSE <- do.call(rbind, save_modBEAMs_control_RMSE) %>% as.data.frame() %>% mutate(., BEAMs="moderate", dataset="Simulated (control)", Group="Uncorrected")
+plot_sevBEAMs_control_RMSE <- do.call(rbind, save_sevBEAMs_control_RMSE) %>% as.data.frame() %>% mutate(., BEAMs="severe", dataset="Simulated (control)", Group="Uncorrected")
+
+plot_modBEAMs_beam_RMSE <- do.call(rbind, save_modBEAMs_beam_RMSE) %>% as.data.frame() %>% mutate(., BEAMs="moderate", dataset="Simulated (BEAMs)", Group="Uncorrected")
+plot_sevBEAMs_beam_RMSE <- do.call(rbind, save_sevBEAMs_beam_RMSE) %>% as.data.frame() %>% mutate(., BEAMs="severe", dataset="Simulated (BEAMs)", Group="Uncorrected")
+
+# Corrected
+plot_ComBat_modBEAMs_control_RMSE <- do.call(rbind, save_ComBat_modBEAMs_control_RMSE) %>% as.data.frame() %>% mutate(., BEAMs="moderate", dataset="Simulated (control)", Group="Corrected")
+plot_ComBat_sevBEAMs_control_RMSE <- do.call(rbind, save_ComBat_sevBEAMs_control_RMSE) %>% as.data.frame() %>% mutate(., BEAMs="severe", dataset="Simulated (control)", Group="Corrected")
+
+plot_ComBat_modBEAMs_beam_RMSE <- do.call(rbind, save_ComBat_modBEAMs_beam_RMSE) %>% as.data.frame() %>% mutate(., BEAMs="moderate", dataset="Simulated (BEAMs)", Group="Corrected")
+plot_ComBat_sevBEAMs_beam_RMSE <- do.call(rbind, save_ComBat_sevBEAMs_beam_RMSE) %>% as.data.frame() %>% mutate(., BEAMs="severe", dataset="Simulated (BEAMs)", Group="Corrected")
+
+colnames(plot_ComBat_modBEAMs_control_RMSE) <- colnames(plot_modBEAMs_control_RMSE)
+colnames(plot_ComBat_sevBEAMs_control_RMSE) <- colnames(plot_modBEAMs_control_RMSE)
+colnames(plot_ComBat_modBEAMs_beam_RMSE) <- colnames(plot_modBEAMs_control_RMSE)
+colnames(plot_ComBat_sevBEAMs_beam_RMSE) <- colnames(plot_modBEAMs_control_RMSE)
+
+plot_all_RMSE <- rbind(plot_modBEAMs_control_RMSE, plot_sevBEAMs_control_RMSE, plot_modBEAMs_beam_RMSE, plot_sevBEAMs_beam_RMSE,
+                        plot_ComBat_modBEAMs_control_RMSE, plot_ComBat_sevBEAMs_control_RMSE,
+                        plot_ComBat_modBEAMs_beam_RMSE, plot_ComBat_sevBEAMs_beam_RMSE)
+
+colnames(plot_all_RMSE) <- colnames(plot_modBEAMs_control_RMSE)
+
+plot_all_RMSE$BEAMs <- as.factor(plot_all_RMSE$BEAMs)
+plot_all_RMSE$dataset <- factor(plot_all_RMSE$dataset, levels= c("Simulated (control)", "Simulated (BEAMs)"))
+plot_all_RMSE$Group <- as.factor(plot_all_RMSE$Group)
+plot_all_RMSE[,1:7] <- apply(plot_all_RMSE, 2, as.numeric)
+plot_all_RMSE2 <- reshape2::melt(plot_all_RMSE, id=c("BEAMs","dataset","Group"))
+
+# Plot the results
+plot_all_RMSE2$Group <- factor(plot_all_RMSE2$Group, levels=c("Uncorrected", "Corrected"))
+
+ggplot(plot_all_RMSE2[plot_all_RMSE2$variable != "Ground truth",], aes(x=BEAMs, y=value, fill=dataset, color=dataset)) + geom_boxplot() + 
+  ggh4x::facet_grid2(Group~variable, scales="free_y", independent="y") +
+     scale_fill_manual(values=c("#00BFCA", "#F8766D")) +
+     scale_color_manual(values=c("#0b5394", "#990000")) +
+     labs(x="", y="RMSE", fill="", color="") +
+     theme(legend.position = "bottom", plot.title = element_text(size=15), legend.text=element_text(face="bold"), axis.text=element_text(face="bold"), axis.text.x = element_text(angle=15, vjust=1, hjust=0.8),strip.text = element_text(size=12, margin=margin(t=1,b=1), face="bold"))
+```
+
+
+Session info
+```{r}
+sessionInfo()
+```
